@@ -722,6 +722,389 @@ static void LoadAndCheckLatestOptions(const char* db_name, rocksdb_env_t* env,
                                       num_column_families);
 }
 
+static const char* CheckBatchValue(rocksdb_pinnableslice_batch_t* batch,
+                                   size_t index, const char* expected,
+                                   size_t expected_len) {
+  char* err = NULL;
+  size_t len = 123;
+  unsigned char found = 2;
+  const char* value =
+      rocksdb_pinnableslice_batch_value(batch, index, &len, &found, &err);
+  CheckNoError(err);
+  CheckCondition(found == (expected != NULL));
+  CheckCondition(len == expected_len);
+  if (expected == NULL) {
+    CheckCondition(value == NULL);
+  } else if (len != 0) {
+    CheckCondition(value != NULL);
+    CheckCondition(memcmp(value, expected, len) == 0);
+  }
+  return value;
+}
+
+static void TestPinnableSliceBatchLifecycle(
+    rocksdb_t* db, const rocksdb_readoptions_t* roptions,
+    rocksdb_column_family_handle_t* cf) {
+  StartPhase("pinnable_slice_batch_lifecycle");
+  rocksdb_pinnableslice_batch_destroy(rocksdb_pinnableslice_batch_create());
+
+  rocksdb_pinnableslice_batch_t* batch = rocksdb_pinnableslice_batch_create();
+  // No accessor marks these placeholders checked. This also exercises moves
+  // and destruction with ROCKSDB_ASSERT_STATUS_CHECKED enabled.
+  const size_t capacities[] = {0, 8, 16, 1, 0, 8};
+  for (size_t i = 0; i < sizeof(capacities) / sizeof(capacities[0]); ++i) {
+    rocksdb_pinnableslice_batch_resize(batch, capacities[i]);
+    rocksdb_pinnableslice_batch_reset_range(batch, 0, capacities[i]);
+  }
+  rocksdb_pinnableslice_batch_destroy(batch);
+  batch = rocksdb_pinnableslice_batch_create();
+  const char* batch_keys[2] = {"box", "buff"};
+  const size_t batch_key_sizes[2] = {3, 4};
+  rocksdb_pinnableslice_batch_resize(batch, 2);
+  CheckBatchValue(batch, 0, NULL, 0);
+  CheckBatchValue(batch, 1, NULL, 0);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, batch_keys,
+                                    batch_key_sizes, batch, false);
+  CheckBatchValue(batch, 0, "c", 1);
+  CheckBatchValue(batch, 1, "rocksdb", 7);
+  rocksdb_pinnableslice_batch_reset(batch, 0);
+  CheckBatchValue(batch, 0, NULL, 0);
+  CheckBatchValue(batch, 1, "rocksdb", 7);
+  rocksdb_pinnableslice_batch_reset_range(batch, 1, 1);
+  CheckBatchValue(batch, 1, NULL, 0);
+
+  // Grow, shrink to zero, and grow again after resetting all results.
+  const size_t resized_capacities[] = {4, 1, 0, 3};
+  for (size_t i = 0;
+       i < sizeof(resized_capacities) / sizeof(resized_capacities[0]); ++i) {
+    size_t capacity = resized_capacities[i];
+    rocksdb_pinnableslice_batch_resize(batch, capacity);
+    rocksdb_pinnableslice_batch_reset_range(batch, capacity, 0);
+    // A zero-key read is also valid on a zero-capacity batch.
+    rocksdb_batched_multi_get_cf_into(db, roptions, cf, 0, batch_keys,
+                                      batch_key_sizes, batch, false);
+    for (size_t index = 0; index < capacity; ++index) {
+      CheckBatchValue(batch, index, NULL, 0);
+    }
+  }
+
+  rocksdb_pinnableslice_batch_destroy(batch);
+}
+
+static void TestPinnableSliceBatchErrors(rocksdb_t* db,
+                                         const rocksdb_readoptions_t* roptions,
+                                         rocksdb_column_family_handle_t* cf) {
+  StartPhase("pinnable_slice_batch_errors");
+
+  rocksdb_pinnableslice_batch_t* batch = rocksdb_pinnableslice_batch_create();
+  const char* batch_keys[2] = {"box", "barfooxx"};
+  const size_t batch_key_sizes[2] = {3, 8};
+  size_t value_len;
+  unsigned char found;
+  char* batch_err = (char*)malloc(32);
+  strcpy(batch_err, "previous error");
+  char* previous_err = batch_err;
+  rocksdb_pinnableslice_batch_resize(batch, 2);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, batch_keys,
+                                    batch_key_sizes, batch, false);
+  // Both a found value and a missing key must preserve an existing error.
+  for (size_t index = 0; index < 2; ++index) {
+    const char* value = rocksdb_pinnableslice_batch_value(
+        batch, index, &value_len, &found, &batch_err);
+    CheckCondition(batch_err == previous_err);
+    CheckCondition(strcmp(batch_err, "previous error") == 0);
+    CheckCondition(found == (index == 0));
+    CheckEqual(index == 0 ? "c" : NULL, value, value_len);
+  }
+  rocksdb_pinnableslice_batch_reset(batch, 0);
+  CheckCondition(rocksdb_pinnableslice_batch_value(batch, 0, &value_len, &found,
+                                                   &batch_err) == NULL);
+  CheckCondition(found == 0);
+  CheckCondition(value_len == 0);
+  CheckCondition(batch_err == previous_err);
+
+  // An unsupported timestamp produces a real read error. Repeated access
+  // must replace the caller's previous malloc-allocated error each time.
+  rocksdb_readoptions_t* error_roptions = rocksdb_readoptions_create();
+  rocksdb_readoptions_set_timestamp(error_roptions, "x", 1);
+  rocksdb_batched_multi_get_cf_into(db, error_roptions, cf, 2, batch_keys,
+                                    batch_key_sizes, batch, false);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const char* value = rocksdb_pinnableslice_batch_value(batch, 0, &value_len,
+                                                          &found, &batch_err);
+    CheckCondition(value == NULL);
+    CheckCondition(found == 0);
+    CheckCondition(value_len == 0);
+    CheckCondition(batch_err != NULL);
+    CheckCondition(strncmp(batch_err, "Invalid argument:", 17) == 0);
+  }
+  rocksdb_free(batch_err);
+
+  // Reusing the batch after errors must restore successful and missing results.
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, batch_keys,
+                                    batch_key_sizes, batch, false);
+  CheckBatchValue(batch, 0, "c", 1);
+  CheckBatchValue(batch, 1, NULL, 0);
+  rocksdb_batched_multi_get_cf_into(db, error_roptions, cf, 2, batch_keys,
+                                    batch_key_sizes, batch, false);
+  batch_err = NULL;
+  CheckCondition(rocksdb_pinnableslice_batch_value(batch, 0, &value_len, &found,
+                                                   &batch_err) == NULL);
+  CheckCondition(found == 0);
+  CheckCondition(value_len == 0);
+  CheckCondition(batch_err != NULL);
+  CheckCondition(strncmp(batch_err, "Invalid argument:", 17) == 0);
+  rocksdb_free(batch_err);
+  rocksdb_readoptions_destroy(error_roptions);
+  // Leave the second error unread to exercise intentional discard.
+  rocksdb_pinnableslice_batch_destroy(batch);
+}
+
+static void TestPinnableSliceBatchReads(rocksdb_t* db,
+                                        const rocksdb_readoptions_t* roptions,
+                                        const rocksdb_writeoptions_t* woptions,
+                                        rocksdb_column_family_handle_t* cf,
+                                        rocksdb_cache_t* cache) {
+  rocksdb_pinnableslice_batch_t* batch = rocksdb_pinnableslice_batch_create();
+  rocksdb_pinnableslice_batch_resize(batch, 8);
+  char large[4096];
+  memset(large, 'L', sizeof(large));
+  const char binary[] = {'\0', 'v', (char)0xff};
+  const char* large_keys[2] = {"large", "large"};
+  const size_t large_key_sizes[2] = {5, 5};
+
+  StartPhase("pinnable_slice_batch_buffer_reuse");
+  // Memtable reads copy into the slice's reusable buffer. Keep the value large
+  // enough to avoid small-string storage, which moves when the vector grows.
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 1, large_keys,
+                                    large_key_sizes, batch, true);
+  uintptr_t address =
+      (uintptr_t)CheckBatchValue(batch, 0, large, sizeof(large));
+  rocksdb_pinnableslice_batch_reset(batch, 0);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 1, large_keys,
+                                    large_key_sizes, batch, true);
+  CheckCondition((uintptr_t)CheckBatchValue(batch, 0, large, sizeof(large)) ==
+                 address);
+  rocksdb_pinnableslice_batch_reset_range(batch, 0, 8);
+  rocksdb_pinnableslice_batch_resize(batch, 16);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 1, large_keys,
+                                    large_key_sizes, batch, true);
+  CheckCondition((uintptr_t)CheckBatchValue(batch, 0, large, sizeof(large)) ==
+                 address);
+  rocksdb_pinnableslice_batch_reset_range(batch, 0, 16);
+
+  // Exercise input order, duplicates, binary keys/values, empty values and
+  // missing keys in both memtables and SSTs, with both sorting modes.
+  const char* keys[2][6] = {
+      {"large", "missing", "empty", "binary\0key", "large", "box"},
+      {"binary\0key", "box", "empty", "large", "large", "missing"}};
+  const size_t key_sizes[2][6] = {{5, 7, 5, 10, 5, 3}, {10, 3, 5, 5, 5, 7}};
+  const char* expected[2][6] = {{large, NULL, "", binary, large, "c"},
+                                {binary, "c", "", large, large, NULL}};
+  const size_t expected_sizes[2][6] = {
+      {sizeof(large), 0, 0, sizeof(binary), sizeof(large), 1},
+      {sizeof(binary), 1, 0, sizeof(large), sizeof(large), 0}};
+  for (int flushed = 0; flushed < 2; ++flushed) {
+    StartPhase(flushed ? "pinnable_slice_batch_sst"
+                       : "pinnable_slice_batch_memtable");
+    if (flushed) {
+      char* err = NULL;
+      rocksdb_flushoptions_t* foptions = rocksdb_flushoptions_create();
+      rocksdb_flushoptions_set_wait(foptions, 1);
+      rocksdb_flush_cf(db, foptions, cf, &err);
+      CheckNoError(err);
+      rocksdb_flushoptions_destroy(foptions);
+    }
+    for (int sorted = 0; sorted < 2; ++sorted) {
+      rocksdb_batched_multi_get_cf_into(db, roptions, cf, 6, keys[sorted],
+                                        key_sizes[sorted], batch, sorted);
+      const char* first = CheckBatchValue(batch, 0, expected[sorted][0],
+                                          expected_sizes[sorted][0]);
+      for (int pass = 0; pass < 2; ++pass) {
+        for (size_t index = 6; index > 0; --index) {
+          CheckBatchValue(batch, index - 1, expected[sorted][index - 1],
+                          expected_sizes[sorted][index - 1]);
+        }
+      }
+      // Accessing other slots must not invalidate previously returned bytes.
+      CheckCondition(
+          memcmp(first, expected[sorted][0], expected_sizes[sorted][0]) == 0);
+      CheckBatchValue(batch, 6, NULL, 0);  // Spare capacity remains empty.
+      rocksdb_pinnableslice_batch_reset_range(batch, 0, 16);
+    }
+  }
+
+  StartPhase("pinnable_slice_batch_partial_reuse");
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 6, keys[1], key_sizes[1],
+                                    batch, true);
+  const char* tail = CheckBatchValue(batch, 4, large, sizeof(large));
+  const char* short_keys[1] = {"buff"};
+  const size_t short_key_sizes[1] = {4};
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 1, short_keys,
+                                    short_key_sizes, batch, true);
+  CheckBatchValue(batch, 0, "rocksdb", 7);
+  CheckCondition(CheckBatchValue(batch, 4, large, sizeof(large)) == tail);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 0, short_keys,
+                                    short_key_sizes, batch, true);
+  CheckBatchValue(batch, 0, "rocksdb", 7);
+  CheckCondition(CheckBatchValue(batch, 4, large, sizeof(large)) == tail);
+  rocksdb_pinnableslice_batch_reset_range(batch, 1, 3);
+  for (size_t index = 1; index < 4; ++index) {
+    CheckBatchValue(batch, index, NULL, 0);
+  }
+  rocksdb_pinnableslice_batch_reset_range(batch, 16, 0);
+  CheckBatchValue(batch, 0, "rocksdb", 7);
+  CheckBatchValue(batch, 4, large, sizeof(large));
+  rocksdb_pinnableslice_batch_reset_range(batch, 0, 16);
+
+  StartPhase("pinnable_slice_batch_snapshot");
+  char* err = NULL;
+  const rocksdb_snapshot_t* snapshot = rocksdb_create_snapshot(db);
+  rocksdb_readoptions_t* snapshot_roptions = rocksdb_readoptions_create();
+  rocksdb_readoptions_set_snapshot(snapshot_roptions, snapshot);
+  const char* snapshot_keys[1] = {"box"};
+  const size_t snapshot_key_sizes[1] = {3};
+  rocksdb_put_cf(db, woptions, cf, "box", 3, "updated", 7, &err);
+  CheckNoError(err);
+  rocksdb_batched_multi_get_cf_into(db, snapshot_roptions, cf, 1, snapshot_keys,
+                                    snapshot_key_sizes, batch, true);
+  CheckBatchValue(batch, 0, "c", 1);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 1, snapshot_keys,
+                                    snapshot_key_sizes, batch, true);
+  CheckBatchValue(batch, 0, "updated", 7);
+  rocksdb_pinnableslice_batch_reset(batch, 0);
+  rocksdb_readoptions_destroy(snapshot_roptions);
+  rocksdb_release_snapshot(db, snapshot);
+  rocksdb_put_cf(db, woptions, cf, "box", 3, "c", 1, &err);
+  CheckNoError(err);
+
+  StartPhase("pinnable_slice_batch_pins");
+  // Warm the SST reader before measuring the pins attributable to results.
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, large_keys,
+                                    large_key_sizes, batch, true);
+  rocksdb_pinnableslice_batch_reset_range(batch, 0, 16);
+  size_t baseline_pins = rocksdb_cache_get_pinned_usage(cache);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, large_keys,
+                                    large_key_sizes, batch, true);
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) > baseline_pins);
+  CheckBatchValue(batch, 0, large, sizeof(large));
+  rocksdb_pinnableslice_batch_reset(batch, 0);
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) > baseline_pins);
+  CheckBatchValue(batch, 1, large, sizeof(large));
+  rocksdb_pinnableslice_batch_reset_range(batch, 1, 1);
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) == baseline_pins);
+
+  // Missing results must also replace old values and release their pins.
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, large_keys,
+                                    large_key_sizes, batch, true);
+  const char* missing_keys[2] = {"missing", "missing"};
+  const size_t missing_key_sizes[2] = {7, 7};
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, missing_keys,
+                                    missing_key_sizes, batch, true);
+  CheckBatchValue(batch, 0, NULL, 0);
+  CheckBatchValue(batch, 1, NULL, 0);
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) == baseline_pins);
+
+  // Timestamp validation fails before the underlying read resets its values.
+  // The C wrapper must still release pins from the previous successful read.
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, large_keys,
+                                    large_key_sizes, batch, true);
+  rocksdb_readoptions_t* error_roptions = rocksdb_readoptions_create();
+  rocksdb_readoptions_set_timestamp(error_roptions, "x", 1);
+  rocksdb_batched_multi_get_cf_into(db, error_roptions, cf, 2, large_keys,
+                                    large_key_sizes, batch, true);
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) == baseline_pins);
+  rocksdb_readoptions_destroy(error_roptions);
+  // Reuse discards unread errors; destruction releases unread pinned values.
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 2, large_keys,
+                                    large_key_sizes, batch, true);
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) > baseline_pins);
+  rocksdb_pinnableslice_batch_reset_range(batch, 0, 16);
+  // Cross the underlying MultiGet's internal batching boundary after growth.
+  const char* many_keys[65];
+  size_t many_key_sizes[65];
+  for (size_t index = 0; index < 65; ++index) {
+    many_keys[index] = "large";
+    many_key_sizes[index] = 5;
+  }
+  rocksdb_pinnableslice_batch_resize(batch, 65);
+  rocksdb_batched_multi_get_cf_into(db, roptions, cf, 65, many_keys,
+                                    many_key_sizes, batch, true);
+  CheckBatchValue(batch, 0, large, sizeof(large));
+  CheckBatchValue(batch, 32, large, sizeof(large));
+  CheckBatchValue(batch, 64, large, sizeof(large));
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) > baseline_pins);
+  rocksdb_pinnableslice_batch_destroy(batch);
+  CheckCondition(rocksdb_cache_get_pinned_usage(cache) == baseline_pins);
+}
+
+static void TestPinnableSliceBatch(void) {
+  StartPhase("pinnable_slice_batch_setup");
+  char path[200];
+  snprintf(path, sizeof(path), "%s/rocksdb_c_batch_test-%d", GetTempDir(),
+           ((int)geteuid()));
+  char* err = NULL;
+  rocksdb_env_t* env = rocksdb_create_default_env();
+  rocksdb_create_dir_if_missing(env, GetTempDir(), &err);
+  CheckNoError(err);
+  rocksdb_env_destroy(env);
+  rocksdb_options_t* options = rocksdb_options_create();
+  rocksdb_options_set_create_if_missing(options, 1);
+  rocksdb_options_set_create_missing_column_families(options, 1);
+  rocksdb_options_set_compression(options, rocksdb_no_compression);
+  // Snapshot release can schedule compaction, whose transient cache pins would
+  // interfere with measuring pins owned by the batch's results.
+  rocksdb_options_set_disable_auto_compactions(options, 1);
+  rocksdb_cache_t* cache = rocksdb_cache_create_lru(16 << 20);
+  rocksdb_block_based_table_options_t* table_options =
+      rocksdb_block_based_options_create();
+  rocksdb_block_based_options_set_block_cache(table_options, cache);
+  rocksdb_options_set_block_based_table_factory(options, table_options);
+  rocksdb_block_based_options_destroy(table_options);
+  rocksdb_destroy_db(options, path, &err);
+  CheckNoError(err);
+  const char* names[2] = {"default", "batch"};
+  const rocksdb_options_t* cf_options[2] = {options, options};
+  rocksdb_column_family_handle_t* handles[2];
+  rocksdb_t* db = rocksdb_open_column_families(options, path, 2, names,
+                                               cf_options, handles, &err);
+  CheckNoError(err);
+  rocksdb_readoptions_t* roptions = rocksdb_readoptions_create();
+  rocksdb_writeoptions_t* woptions = rocksdb_writeoptions_create();
+  // A different value under the same key catches using the wrong CF.
+  rocksdb_put_cf(db, woptions, handles[0], "box", 3, "default", 7, &err);
+  CheckNoError(err);
+  rocksdb_put_cf(db, woptions, handles[1], "box", 3, "c", 1, &err);
+  CheckNoError(err);
+  rocksdb_put_cf(db, woptions, handles[1], "buff", 4, "rocksdb", 7, &err);
+  CheckNoError(err);
+  rocksdb_put_cf(db, woptions, handles[1], "empty", 5, "", 0, &err);
+  CheckNoError(err);
+  const char binary[] = {'\0', 'v', (char)0xff};
+  rocksdb_put_cf(db, woptions, handles[1], "binary\0key", 10, binary,
+                 sizeof(binary), &err);
+  CheckNoError(err);
+  char large[4096];
+  memset(large, 'L', sizeof(large));
+  rocksdb_put_cf(db, woptions, handles[1], "large", 5, large, sizeof(large),
+                 &err);
+  CheckNoError(err);
+
+  TestPinnableSliceBatchLifecycle(db, roptions, handles[1]);
+  TestPinnableSliceBatchReads(db, roptions, woptions, handles[1], cache);
+  TestPinnableSliceBatchErrors(db, roptions, handles[1]);
+
+  rocksdb_column_family_handle_destroy(handles[0]);
+  rocksdb_column_family_handle_destroy(handles[1]);
+  rocksdb_close(db);
+  rocksdb_destroy_db(options, path, &err);
+  CheckNoError(err);
+  rocksdb_options_destroy(options);
+  rocksdb_readoptions_destroy(roptions);
+  rocksdb_writeoptions_destroy(woptions);
+  rocksdb_cache_destroy(cache);
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -759,6 +1142,8 @@ int main(int argc, char** argv) {
 
   snprintf(dbpathname, sizeof(dbpathname), "%s/rocksdb_c_test-%d-dbpath",
            GetTempDir(), ((int)geteuid()));
+
+  TestPinnableSliceBatch();
 
   StartPhase("create_objects");
   cmp = rocksdb_comparator_create(NULL, CmpDestroy, CmpCompare, CmpName);
