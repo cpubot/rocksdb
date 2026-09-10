@@ -279,6 +279,11 @@ struct rocksdb_perfcontext_t {
 struct rocksdb_pinnableslice_t {
   PinnableSlice rep;
 };
+struct rocksdb_pinnableslice_batch_t {
+  std::vector<PinnableSlice> values;
+  std::vector<Slice> keys;
+  std::vector<Status> statuses;
+};
 struct rocksdb_transactiondb_options_t {
   TransactionDBOptions rep;
 };
@@ -1650,6 +1655,88 @@ void rocksdb_batched_multi_get_cf(rocksdb_t* db,
   delete[] key_slices;
   delete[] value_slices;
   delete[] statuses;
+}
+
+rocksdb_pinnableslice_batch_t* rocksdb_pinnableslice_batch_create() {
+  return new rocksdb_pinnableslice_batch_t;
+}
+
+void rocksdb_pinnableslice_batch_destroy(rocksdb_pinnableslice_batch_t* batch) {
+  // Spare slots and unread results are intentionally discarded with the batch.
+  for (const auto& status : batch->statuses) {
+    status.PermitUncheckedError();
+  }
+  delete batch;
+}
+
+void rocksdb_pinnableslice_batch_resize(rocksdb_pinnableslice_batch_t* batch,
+                                        size_t capacity) {
+  batch->values.resize(capacity);
+  batch->keys.resize(capacity);
+  // Shrinking explicitly discards the trailing slots before their destruction.
+  for (size_t i = capacity; i < batch->statuses.size(); ++i) {
+    batch->statuses[i].PermitUncheckedError();
+  }
+  batch->statuses.resize(capacity);
+  // Resizing requires reset values: these statuses are only empty placeholders.
+  // Moving existing Status objects during growth also makes them unchecked
+  // again.
+  for (const auto& status : batch->statuses) {
+    status.PermitUncheckedError();
+  }
+}
+
+void rocksdb_pinnableslice_batch_reset(rocksdb_pinnableslice_batch_t* batch,
+                                       size_t index) {
+  assert(index < batch->values.size());
+  batch->values[index].Reset();
+  batch->statuses[index] = Status::OK();
+  // This is an empty slot, not a new operation whose result must be inspected.
+  batch->statuses[index].PermitUncheckedError();
+}
+
+void rocksdb_pinnableslice_batch_reset_range(
+    rocksdb_pinnableslice_batch_t* batch, size_t start, size_t count) {
+  assert(start <= batch->values.size());
+  assert(count <= batch->values.size() - start);
+  for (size_t i = start; i < start + count; ++i) {
+    rocksdb_pinnableslice_batch_reset(batch, i);
+  }
+}
+
+void rocksdb_batched_multi_get_cf_into(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_batch_t* batch, const bool sorted_input) {
+  assert(num_keys <= batch->values.size());
+  for (size_t i = 0; i < num_keys; ++i) {
+    batch->values[i].Reset();
+    batch->keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+  }
+  if (num_keys != 0) {
+    db->rep->MultiGet(options->rep, column_family->rep, num_keys,
+                      batch->keys.data(), batch->values.data(),
+                      batch->statuses.data(), sorted_input);
+  }
+}
+
+const char* rocksdb_pinnableslice_batch_value(
+    const rocksdb_pinnableslice_batch_t* batch, size_t index, size_t* value_len,
+    unsigned char* found, char** err) {
+  assert(index < batch->values.size());
+  const auto& status = batch->statuses[index];
+  *found = status.ok();
+  *err = nullptr;
+  *value_len = 0;
+  if (status.ok()) {
+    *value_len = batch->values[index].size();
+    return batch->values[index].data();
+  }
+  if (!status.IsNotFound()) {
+    *err = strdup(status.ToString().c_str());
+  }
+  return nullptr;
 }
 
 unsigned char rocksdb_key_may_exist(rocksdb_t* db,

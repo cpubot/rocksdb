@@ -126,6 +126,7 @@ typedef struct rocksdb_sstfilewriter_t rocksdb_sstfilewriter_t;
 typedef struct rocksdb_ratelimiter_t rocksdb_ratelimiter_t;
 typedef struct rocksdb_perfcontext_t rocksdb_perfcontext_t;
 typedef struct rocksdb_pinnableslice_t rocksdb_pinnableslice_t;
+typedef struct rocksdb_pinnableslice_batch_t rocksdb_pinnableslice_batch_t;
 typedef struct rocksdb_transactiondb_options_t rocksdb_transactiondb_options_t;
 typedef struct rocksdb_transactiondb_t rocksdb_transactiondb_t;
 typedef struct rocksdb_transaction_options_t rocksdb_transaction_options_t;
@@ -591,6 +592,33 @@ extern ROCKSDB_LIBRARY_API void rocksdb_batched_multi_get_cf(
     rocksdb_column_family_handle_t* column_family, size_t num_keys,
     const char* const* keys_list, const size_t* keys_list_sizes,
     rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input);
+
+// Reusable contiguous value storage and MultiGet scratch arrays. Capacity is
+// explicitly chosen by the caller; MultiGet never grows or shrinks the batch.
+extern ROCKSDB_LIBRARY_API rocksdb_pinnableslice_batch_t*
+rocksdb_pinnableslice_batch_create(void);
+extern ROCKSDB_LIBRARY_API void rocksdb_pinnableslice_batch_destroy(
+    rocksdb_pinnableslice_batch_t* batch);
+// All values must have been reset before resizing. Invalidates value pointers.
+extern ROCKSDB_LIBRARY_API void rocksdb_pinnableslice_batch_resize(
+    rocksdb_pinnableslice_batch_t* batch, size_t capacity);
+extern ROCKSDB_LIBRARY_API void rocksdb_pinnableslice_batch_reset(
+    rocksdb_pinnableslice_batch_t* batch, size_t index);
+// Releases values in [start, start + count), retaining copied-value buffers.
+// The range must be within the capacity supplied to resize.
+extern ROCKSDB_LIBRARY_API void rocksdb_pinnableslice_batch_reset_range(
+    rocksdb_pinnableslice_batch_t* batch, size_t start, size_t count);
+// num_keys must not exceed the capacity supplied to resize.
+extern ROCKSDB_LIBRARY_API void rocksdb_batched_multi_get_cf_into(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_batch_t* batch, const bool sorted_input);
+// A found value's bytes remain valid until that element is reset, or the batch
+// is reused, resized or destroyed. Errors must be released with rocksdb_free.
+extern ROCKSDB_LIBRARY_API const char* rocksdb_pinnableslice_batch_value(
+    const rocksdb_pinnableslice_batch_t* batch, size_t index, size_t* value_len,
+    unsigned char* found, char** err);
 
 // The value is only allocated (using malloc) and returned if it is found and
 // value_found isn't NULL. In that case the user is responsible for freeing it.
